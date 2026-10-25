@@ -243,12 +243,13 @@ export default function AuthPage() {
           </form>
 
           {/* Quick Demo Credentials */}
-          {/* <div className="mt-6 pt-5 border-t border-slate-800">
+          <div className="mt-6 pt-5 border-t border-slate-800">
             <p className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider text-center mb-2.5">
-              Instant Demo Access
+              Created By
             </p>
-            <div className="grid grid-cols-2 gap-2 text-xs">
-              <button
+            <div className="text-center">
+                  <i>JAY</i>
+              {/* <button
                 type="button"
                 onClick={() => handleQuickLogin('owner@example.com', 'admin123')}
                 disabled={loading}
@@ -272,9 +273,9 @@ export default function AuthPage() {
                   <span>Login Member</span>
                 </span>
                 <span className="text-[10px] text-slate-400">Track outreach</span>
-              </button>
+              </button> */}
             </div>
-          </div> */}
+          </div>
         </div>
       </div>
     </div>
