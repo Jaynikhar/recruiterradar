@@ -8,7 +8,9 @@ const authRoutes = require('./routes/authRoutes');
 const recruiterRoutes = require('./routes/recruiterRoutes');
 
 const app = express();
-const PORT = process.env.PORT || 5000;
+// Ensure PORT is always a valid numeric port (Render sets this automatically to a number like 10000)
+const parsedPort = parseInt(process.env.PORT, 10);
+const PORT = !isNaN(parsedPort) && parsedPort > 0 ? parsedPort : 5000;
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/recruiter_crm';
 
 // Middlewares
