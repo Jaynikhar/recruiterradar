@@ -55,7 +55,21 @@ async function seedDatabase() {
         const csvContent = fs.readFileSync(csvPath, 'utf8');
         const records = parseCsvString(csvContent);
         console.log(`Parsed ${records.length} recruiter records. Seeding database...`);
-        const inserted = await Recruiter.insertMany(records, { ordered: false });
+
+        const masterRecords = records.map((r) => ({
+          name: r.name,
+          jobTitle: r.jobTitle,
+          linkedinUrl: r.linkedinUrl,
+          companyName: r.companyName,
+          companyWebsite: r.companyWebsite,
+          companyLinkedin: r.companyLinkedin,
+          companySocial: r.companySocial,
+          companyTwitter: r.companyTwitter,
+          location: r.location,
+          companyNiche: r.companyNiche,
+        }));
+
+        const inserted = await Recruiter.insertMany(masterRecords, { ordered: false });
         console.log(`Successfully seeded ${inserted.length} recruiters into MongoDB!`);
       } else {
         console.log(`Database already has ${count} recruiters. Skipping duplicate seed.`);

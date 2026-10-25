@@ -1,13 +1,16 @@
 const fs = require('fs');
 const path = require('path');
+const mongoose = require('mongoose');
 const Recruiter = require('../models/Recruiter');
+const UserOutreach = require('../models/UserOutreach');
 const { parseSpreadsheetFile, parseCsvString } = require('../utils/excelParser');
 
 /**
- * Get paginated, filtered, and sorted recruiters
+ * Get paginated, filtered, and sorted recruiters with isolated user tracking
  */
 exports.getRecruiters = async (req, res) => {
   try {
+    const userId = new mongoose.Types.ObjectId(req.user._id);
     const page = Math.max(1, parseInt(req.query.page) || 1);
     const limit = Math.max(1, Math.min(200, parseInt(req.query.limit) || 30));
     const skip = (page - 1) * limit;
@@ -22,46 +25,85 @@ exports.getRecruiters = async (req, res) => {
       niche,
     } = req.query;
 
-    const query = {};
-
-    // Filter by outreach status
-    if (requested === 'true') {
-      query.requested = true;
-    } else if (requested === 'false') {
-      query.requested = false;
-    }
-
-    if (messaged === 'true') {
-      query.messaged = true;
-    } else if (messaged === 'false') {
-      query.messaged = false;
-    }
+    const baseMatch = {};
 
     // Filter by location
     if (location && location !== 'all') {
-      query.location = { $regex: new RegExp(`^${location.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') };
+      baseMatch.location = { $regex: new RegExp(`^${location.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') };
     }
 
     // Filter by niche
     if (niche && niche !== 'all') {
-      query.companyNiche = { $regex: new RegExp(`^${niche.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') };
+      baseMatch.companyNiche = { $regex: new RegExp(`^${niche.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') };
     }
 
-    // Search query
+    // Search query on core recruiter attributes
     if (search && search.trim()) {
       const s = search.trim();
       const regex = new RegExp(s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-      query.$or = [
+      baseMatch.$or = [
         { name: regex },
         { companyName: regex },
         { jobTitle: regex },
         { location: regex },
         { companyNiche: regex },
-        { statusNotes: regex },
       ];
     }
 
-    // Sorting definition
+    // Aggregation pipeline: Join UserOutreach collection specifically for req.user._id
+    const pipeline = [
+      { $match: baseMatch },
+      {
+        $lookup: {
+          from: 'useroutreaches',
+          let: { recruiterId: '$_id' },
+          pipeline: [
+            {
+              $match: {
+                $expr: {
+                  $and: [
+                    { $eq: ['$recruiter', '$$recruiterId'] },
+                    { $eq: ['$user', userId] },
+                  ],
+                },
+              },
+            },
+          ],
+          as: 'userTracking',
+        },
+      },
+      {
+        $addFields: {
+          requested: { $ifNull: [{ $arrayElemAt: ['$userTracking.requested', 0] }, false] },
+          messaged: { $ifNull: [{ $arrayElemAt: ['$userTracking.messaged', 0] }, false] },
+          applied: { $ifNull: [{ $arrayElemAt: ['$userTracking.applied', 0] }, false] },
+          statusNotes: { $ifNull: [{ $arrayElemAt: ['$userTracking.statusNotes', 0] }, ''] },
+          userTrackingUpdatedAt: {
+            $ifNull: [{ $arrayElemAt: ['$userTracking.updatedAt', 0] }, '$updatedAt'],
+          },
+        },
+      },
+    ];
+
+    // Filter by current user's outreach status
+    const postMatch = {};
+    if (requested === 'true') {
+      postMatch.requested = true;
+    } else if (requested === 'false') {
+      postMatch.requested = false;
+    }
+
+    if (messaged === 'true') {
+      postMatch.messaged = true;
+    } else if (messaged === 'false') {
+      postMatch.messaged = false;
+    }
+
+    if (Object.keys(postMatch).length > 0) {
+      pipeline.push({ $match: postMatch });
+    }
+
+    // Sorting
     const sort = {};
     const orderDirection = sortOrder.toLowerCase() === 'asc' ? 1 : -1;
 
@@ -77,22 +119,36 @@ exports.getRecruiters = async (req, res) => {
         break;
       case 'requested':
         sort.requested = orderDirection;
+        sort._id = 1;
         break;
       case 'messaged':
         sort.messaged = orderDirection;
+        sort._id = 1;
         break;
       case 'updatedAt':
-        sort.updatedAt = orderDirection;
+        sort.userTrackingUpdatedAt = orderDirection;
         break;
       default:
         sort.createdAt = orderDirection;
     }
 
-    const [recruiters, total] = await Promise.all([
-      Recruiter.find(query).sort(sort).skip(skip).limit(limit).lean(),
-      Recruiter.countDocuments(query),
-    ]);
+    pipeline.push({ $sort: sort });
 
+    // Pagination using $facet
+    pipeline.push({
+      $facet: {
+        metadata: [{ $count: 'total' }],
+        data: [
+          { $skip: skip },
+          { $limit: limit },
+          { $project: { userTracking: 0 } },
+        ],
+      },
+    });
+
+    const results = await Recruiter.aggregate(pipeline);
+    const total = results[0]?.metadata[0]?.total || 0;
+    const recruiters = results[0]?.data || [];
     const totalPages = Math.ceil(total / limit) || 1;
 
     return res.json({
@@ -144,14 +200,19 @@ exports.getFilterOptions = async (req, res) => {
 };
 
 /**
- * Get analytics & outreach statistics
+ * Get analytics & outreach statistics strictly for the authenticated user
  */
 exports.getStats = async (req, res) => {
   try {
+    const userId = req.user._id;
     const total = await Recruiter.countDocuments();
-    const requestedCount = await Recruiter.countDocuments({ requested: true });
-    const messagedCount = await Recruiter.countDocuments({ messaged: true });
-    const bothCount = await Recruiter.countDocuments({ requested: true, messaged: true });
+    const requestedCount = await UserOutreach.countDocuments({ user: userId, requested: true });
+    const messagedCount = await UserOutreach.countDocuments({ user: userId, messaged: true });
+    const bothCount = await UserOutreach.countDocuments({
+      user: userId,
+      requested: true,
+      messaged: true,
+    });
 
     return res.json({
       success: true,
@@ -170,12 +231,18 @@ exports.getStats = async (req, res) => {
 };
 
 /**
- * Update a single recruiter (checkboxes, status notes, etc.)
+ * Update a recruiter for the authenticated user only (checkboxes, status notes)
  */
 exports.updateRecruiter = async (req, res) => {
   try {
     const { id } = req.params;
+    const userId = req.user._id;
     const { requested, messaged, applied, statusNotes } = req.body;
+
+    const recruiter = await Recruiter.findById(id).lean();
+    if (!recruiter) {
+      return res.status(404).json({ success: false, message: 'Recruiter not found.' });
+    }
 
     const updateFields = {};
     if (requested !== undefined) updateFields.requested = Boolean(requested);
@@ -183,26 +250,22 @@ exports.updateRecruiter = async (req, res) => {
     if (applied !== undefined) updateFields.applied = Boolean(applied);
     if (statusNotes !== undefined) updateFields.statusNotes = String(statusNotes);
 
-    const recruiter = await Recruiter.findById(id);
-    if (!recruiter) {
-      return res.status(404).json({ success: false, message: 'Recruiter not found.' });
-    }
-
-    // If statusNotes changed, record history entry
-    if (statusNotes !== undefined && statusNotes !== recruiter.statusNotes) {
-      recruiter.history.push({
-        note: statusNotes,
-        updatedAt: new Date(),
-      });
-    }
-
-    Object.assign(recruiter, updateFields);
-    await recruiter.save();
+    const userOutreach = await UserOutreach.findOneAndUpdate(
+      { user: userId, recruiter: id },
+      { $set: updateFields },
+      { new: true, upsert: true, setDefaultsOnInsert: true }
+    ).lean();
 
     return res.json({
       success: true,
-      message: 'Recruiter updated successfully.',
-      recruiter,
+      message: 'Recruiter updated successfully for your account.',
+      recruiter: {
+        ...recruiter,
+        requested: userOutreach.requested,
+        messaged: userOutreach.messaged,
+        applied: userOutreach.applied,
+        statusNotes: userOutreach.statusNotes,
+      },
     });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
@@ -218,7 +281,7 @@ exports.uploadExcel = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Please upload an Excel (.xlsx, .xls) or CSV file.' });
     }
 
-    const mode = req.body.mode || 'append'; // 'append' or 'replace'
+    const mode = req.body.mode || 'append'; // 'append' | 'replace'
     let parsedRows = [];
 
     const originalName = req.file.originalname.toLowerCase();
@@ -238,10 +301,43 @@ exports.uploadExcel = async (req, res) => {
 
     if (mode === 'replace') {
       await Recruiter.deleteMany({});
+      await UserOutreach.deleteMany({});
     }
 
-    // Insert batch
-    const result = await Recruiter.insertMany(parsedRows, { ordered: false });
+    // Insert master recruiter records (clean from any user-specific flags)
+    const masterRecords = parsedRows.map((r) => ({
+      name: r.name,
+      jobTitle: r.jobTitle,
+      linkedinUrl: r.linkedinUrl,
+      companyName: r.companyName,
+      companyWebsite: r.companyWebsite,
+      companyLinkedin: r.companyLinkedin,
+      companySocial: r.companySocial,
+      companyTwitter: r.companyTwitter,
+      location: r.location,
+      companyNiche: r.companyNiche,
+    }));
+
+    const result = await Recruiter.insertMany(masterRecords, { ordered: false });
+
+    // If the uploaded rows have initial requested/messaged status, assign to the uploading Owner's tracker
+    const ownerOutreachRecords = [];
+    result.forEach((inserted, idx) => {
+      const original = parsedRows[idx];
+      if (original && (original.requested || original.messaged || original.statusNotes)) {
+        ownerOutreachRecords.push({
+          user: req.user._id,
+          recruiter: inserted._id,
+          requested: Boolean(original.requested),
+          messaged: Boolean(original.messaged),
+          statusNotes: original.statusNotes || '',
+        });
+      }
+    });
+
+    if (ownerOutreachRecords.length > 0) {
+      await UserOutreach.insertMany(ownerOutreachRecords, { ordered: false });
+    }
 
     return res.json({
       success: true,
@@ -271,9 +367,23 @@ exports.seedDefaultData = async (req, res) => {
     const mode = req.body.mode || 'replace';
     if (mode === 'replace') {
       await Recruiter.deleteMany({});
+      await UserOutreach.deleteMany({});
     }
 
-    const inserted = await Recruiter.insertMany(parsedRows, { ordered: false });
+    const masterRecords = parsedRows.map((r) => ({
+      name: r.name,
+      jobTitle: r.jobTitle,
+      linkedinUrl: r.linkedinUrl,
+      companyName: r.companyName,
+      companyWebsite: r.companyWebsite,
+      companyLinkedin: r.companyLinkedin,
+      companySocial: r.companySocial,
+      companyTwitter: r.companyTwitter,
+      location: r.location,
+      companyNiche: r.companyNiche,
+    }));
+
+    const inserted = await Recruiter.insertMany(masterRecords, { ordered: false });
 
     return res.json({
       success: true,
@@ -295,6 +405,7 @@ exports.deleteRecruiter = async (req, res) => {
     if (!recruiter) {
       return res.status(404).json({ success: false, message: 'Recruiter not found.' });
     }
+    await UserOutreach.deleteMany({ recruiter: id });
     return res.json({ success: true, message: 'Recruiter deleted successfully.' });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
@@ -307,7 +418,8 @@ exports.deleteRecruiter = async (req, res) => {
 exports.clearRecruiters = async (req, res) => {
   try {
     await Recruiter.deleteMany({});
-    return res.json({ success: true, message: 'All recruiters have been cleared.' });
+    await UserOutreach.deleteMany({});
+    return res.json({ success: true, message: 'All recruiters and tracking records have been cleared.' });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
   }
